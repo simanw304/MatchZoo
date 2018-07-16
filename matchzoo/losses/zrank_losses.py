@@ -16,6 +16,27 @@ def deserialize(name, custom_objects=None):
                                     custom_objects=custom_objects,
                                     printable_module_name='loss function')
 
+def rank_hinge_loss(kwargs=None):
+    margin = 1.
+    if isinstance(kwargs, dict) and 'margin' in kwargs:
+        margin = kwargs['margin']
+
+    def _margin_loss(y_true, y_pred):
+        # output_shape = K.int_shape(y_pred)
+        t1 = []
+        for y in range(0, batch, 2):
+            x = y_pred.slice(0, y, 1)
+            t1.append(x)
+        y_pos = merge(t1, mode="concat", concat_axis=0)
+        t2 = []
+        for y in range(1, batch, 2):
+            x = y_pred.slice(0, y, 1)
+            t2.append(x)
+        y_neg = merge(t2, mode="concat", concat_axis=0)
+        loss = A.maximum(0., margin + y_neg - y_pos)
+        return loss
+    return _margin_loss
+
 def get(identifier):
     if identifier is None:
         return None
