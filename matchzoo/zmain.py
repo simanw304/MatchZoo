@@ -1,4 +1,3 @@
-# -*- coding: utf8 -*-
 from __future__ import print_function
 import os
 import sys
@@ -14,43 +13,83 @@ tensorflow.set_random_seed(49999)
 
 from collections import OrderedDict
 
-import keras
-import keras.backend as K
-from keras.models import Sequential, Model
+from zoo.pipeline.api.autograd import *
+from zoo.pipeline.api.keras.layers import *
+from zoo.pipeline.api.keras.models import *
+from bigdl.keras.converter import WeightsConverter
+from bigdl.optim.optimizer import Adam
+from zoo.pipeline.api.keras.engine.topology import *
+import numpy as np
+import keras.backend as KK
+import keras.layers as klayers
 
 from utils import *
+from losses import zrank_losses
 import inputs
-import matchzoo.metrics as metric
-from losses import *
-from optimizers import *
+import metrics
+
+np.random.seed(1330)
 
 config = tensorflow.ConfigProto()
 config.gpu_options.allow_growth = True
 sess = tensorflow.Session(config = config)
 
-def load_model(config):
+def load_zoo_model(config):
     global_conf = config["global"]
     model_type = global_conf['model_type']
-    if model_type == 'JSON':
-        mo = Model.from_config(config['model'])
-    elif model_type == 'PY':
-        model_config = config['kmodel']['setting']
-        model_config.update(config['inputs']['share'])
-        sys.path.insert(0, config['kmodel']['model_path'])
+    model_config = config['zmodel']['setting']
+    model_config.update(config['inputs']['share'])
+    sys.path.insert(0, config['zmodel']['model_path'])
 
-        model = import_object(config['kmodel']['model_py'], model_config)
-        mo = model.build()
+    model = import_object(config['zmodel']['model_py'], model_config)
+    mo = model.build()
     return mo
 
+def load_keras2_model(config):
+    global_conf = config["global"]
+    model_type = global_conf['model_type']
+    model_config = config['kmodel']['setting']
+    model_config.update(config['inputs']['share'])
+    sys.path.insert(0, config['kmodel']['model_path'])
+
+    model = import_object(config['kmodel']['model_py'], model_config)
+    mo = model.build()
+    return mo
+
+
+def zloss(**kwargs):
+    if isinstance(kwargs, dict) and 'batch' in kwargs:
+        batch = kwargs['batch']
+    def _zloss(y_true, y_pred):
+        y_pred = y_pred + y_true - y_true
+        margin = 1.0
+        t1 = []
+        for y in range(0, batch, 2):
+            x = y_pred.slice(0, y, 1)
+            t1.append(x)
+        pos = merge(t1, mode="concat", concat_axis=0)
+        t2 = []
+        for y in range(1, batch, 2):
+            x = y_pred.slice(0, y, 1)
+            t2.append(x)
+        neg = merge(t2, mode="concat", concat_axis=0)
+        loss = maximum(neg - pos + margin, 0.)
+        return loss
+    return _zloss
+
+
+def kloss(y_true, y_pred):
+    margin = 1.0
+    y_pos = klayers.Lambda(lambda a: a[::2, :], output_shape=(1,))(y_pred)
+    y_neg = klayers.Lambda(lambda a: a[1::2, :], output_shape=(1,))(y_pred)
+    loss = KK.maximum(0., margin + y_neg - y_pos)
+    return KK.mean(loss)
 
 def train(config):
 
     print(json.dumps(config, indent=2), end='\n')
     # read basic config
     global_conf = config["global"]
-    optimizer = global_conf['optimizer']
-    optimizer=optimizers.get(optimizer)
-    K.set_value(optimizer.lr, global_conf['learning_rate'])
     weights_file = str(global_conf['weights_file']) + '.%d'
     display_interval = int(global_conf['display_interval'])
     num_iters = int(global_conf['num_iters'])
@@ -123,45 +162,72 @@ def train(config):
         eval_gen[tag] = generator( config = conf )
 
     ######### Load Model #########
-    model = load_model(config)
+    zmodel = load_zoo_model(config)
 
     loss = []
+
     for lobj in config['losses']:
-        if lobj['object_name'] in mz_specialized_losses:
-            loss.append(rank_losses.get(lobj['object_name'])(lobj['object_params']))
+        if lobj['object_name'] in zrank_losses.mz_specialized_losses:
+            loss.append(zrank_losses.get(lobj['object_name'])(lobj['object_params']))
         else:
-            loss.append(rank_losses.get(lobj['object_name']))
+            loss.append(zrank_losses.get(lobj['object_name']))
     eval_metrics = OrderedDict()
     for mobj in config['metrics']:
         mobj = mobj.lower()
         if '@' in mobj:
             mt_key, mt_val = mobj.split('@', 1)
-            eval_metrics[mobj] = metric.get(mt_key)(int(mt_val))
+            eval_metrics[mobj] = metrics.get(mt_key)(int(mt_val))
         else:
-            eval_metrics[mobj] = metric.get(mobj)
-    model.compile(optimizer=optimizer, loss=loss)
+            eval_metrics[mobj] = metrics.get(mobj)
+
+    zmodel.compile(optimizer='adam', loss=zloss(batch=10))
     print('[Model] Model Compile Done.', end='\n')
+    zoo_input_data = []
+    zoo_label = []
+    count = 0
 
     for i_e in range(num_iters):
         for tag, generator in train_gen.items():
             genfun = generator.get_batch_generator()
-            print('[%s]\t[Train:%s] ' % (time.strftime('%m-%d-%Y %H:%M:%S', time.localtime(time.time())), tag), end='')
-            history = model.fit_generator(
-                    genfun,
-                    steps_per_epoch = display_interval,
-                    epochs = 1,
-                    shuffle=False,
-                    verbose = 0
-                ) #callbacks=[eval_map])
-            print('Iter:%d\tloss=%.6f' % (i_e, history.history['loss'][0]), end='\n')
+            for input_data, y_true_value in genfun:
+                count += 1
+                if count > 10:
+                    break
+                names = ['query', 'doc']
+                shapes = [(None, 10), (None, 40)]
+                list_input_data = standardize_input_data(input_data, names, shapes, check_batch_axis=False)
+                zoo_input_data.append(list_input_data)
+                y_true_value = np.expand_dims(y_true_value, 1)
+                zoo_label.append(y_true_value)
 
+    #stack input data and label
+    zinput1 = []
+    for x in zoo_input_data:
+        zinput1.append(x[0])
+    zinput1 = np.concatenate(zinput1)
+    zinput2 = []
+    for x in zoo_input_data:
+        zinput2.append(x[1])
+    zinput2 = np.concatenate(zinput2)
+
+    zinput = []
+    zinput.append(zinput1)
+    zinput.append(zinput2)
+
+    zlabel = np.concatenate(zoo_label)
+    zmodel.fit(zinput, zlabel, batch_size=280, nb_epoch=1, distributed=False)
+
+    for i_e in range(num_iters):
         for tag, generator in eval_gen.items():
             genfun = generator.get_batch_generator()
             print('[%s]\t[Eval:%s] ' % (time.strftime('%m-%d-%Y %H:%M:%S', time.localtime(time.time())), tag), end='')
             res = dict([[k,0.] for k in eval_metrics.keys()])
             num_valid = 0
             for input_data, y_true in genfun:
-                y_pred = model.predict(input_data, batch_size=len(y_true))
+                names = ['query', 'doc']
+                shapes = [(None, 10), (None, 40)]
+                list_input_data = standardize_input_data(input_data, names, shapes, check_batch_axis=False)
+                y_pred = zmodel.forward(list_input_data)
                 if issubclass(type(generator), inputs.list_generator.ListBasicGenerator):
                     list_counts = input_data['list_counts']
                     for k, eval_func in eval_metrics.items():
@@ -177,8 +243,94 @@ def train(config):
             generator.reset()
             print('Iter:%d\t%s' % (i_e, '\t'.join(['%s=%f'%(k,v/num_valid) for k, v in res.items()])), end='\n')
             sys.stdout.flush()
-        if (i_e+1) % save_weights_iters == 0:
-            model.save_weights(weights_file % (i_e+1))
+        # if (i_e+1) % save_weights_iters == 0:
+        #     zmodel.save_weights(weights_file % (i_e+1))
+
+
+def standardize_input_data(data, names, shapes=None,
+                           check_batch_axis=True,
+                           exception_prefix=''
+                           ):
+    if not names:
+        if data is not None and hasattr(data, '__len__') and len(data):
+            raise ValueError('Error when checking model ' +
+                             exception_prefix + ': '
+                             'expected no data, but got:', data)
+        return []
+    if data is None:
+        return [None for _ in range(len(names))]
+
+    if isinstance(data, dict):
+        try:
+            data = [data[x].values if data[x].__class__.__name__ == 'DataFrame' else data[x] for x in names]
+        except KeyError as e:
+            raise ValueError(
+                'No data provided for "' + e.args[0] + '". Need data '
+                'for each key in: ' + str(names))
+    elif isinstance(data, list):
+        if len(names) == 1 and data and isinstance(data[0], (float, int)):
+            data = [np.asarray(data)]
+        else:
+            data = [x.values if x.__class__.__name__ == 'DataFrame' else x for x in data]
+    else:
+        data = data.values if data.__class__.__name__ == 'DataFrame' else data
+        data = [data]
+    data = [np.expand_dims(x, 1) if x is not None and x.ndim == 1 else x for x in data]
+
+    if len(data) != len(names):
+        if data and hasattr(data[0], 'shape'):
+            raise ValueError(
+                'Error when checking model ' + exception_prefix +
+                ': the list of Numpy arrays that you are passing to '
+                'your model is not the size the model expected. '
+                'Expected to see ' + str(len(names)) + ' array(s), '
+                'but instead got the following list of ' +
+                str(len(data)) + ' arrays: ' + str(data)[:200] + '...')
+        elif len(names) > 1:
+            raise ValueError(
+                'Error when checking model ' + exception_prefix +
+                ': you are passing a list as input to your model, '
+                'but the model expects a list of ' + str(len(names)) +
+                ' Numpy arrays instead. The list you passed was: ' +
+                str(data)[:200])
+        elif len(data) == 1 and not hasattr(data[0], 'shape'):
+            raise TypeError(
+                'Error when checking model ' + exception_prefix +
+                ': data should be a Numpy array, or list/dict of '
+                'Numpy arrays. Found: ' + str(data)[:200] + '...')
+        elif len(names) == 1:
+            data = [np.asarray(data)]
+
+    # Check shapes compatibility.
+    if shapes:
+        for i in range(len(names)):
+            if shapes[i] is not None:
+                data_shape = data[i].shape
+                shape = shapes[i]
+                if data[i].ndim != len(shape):
+                    raise ValueError(
+                        'Error when checking ' + exception_prefix +
+                        ': expected ' + names[i] + ' to have ' +
+                        str(len(shape)) + ' dimensions, but got array '
+                        'with shape ' + str(data_shape))
+                if not check_batch_axis:
+                    data_shape = data_shape[1:]
+                    shape = shape[1:]
+                for dim, ref_dim in zip(data_shape, shape):
+                    if ref_dim != dim and ref_dim:
+                        raise ValueError(
+                            'Error when checking ' + exception_prefix +
+                            ': expected ' + names[i] + ' to have shape ' +
+                            str(shape) + ' but got array with shape ' +
+                            str(data_shape))
+    return data
+
+def set_weights_per_layer(kmodel, zmodel, layer_name):
+    klayer = kmodel.get_layer(layer_name)
+    klayer_weights = klayer.get_weights()
+    zlayer_weights = WeightsConverter.to_bigdl_weights(klayer, klayer_weights)
+    zlayer = [l for l in zmodel.layers if l.name() == layer_name][0] # assert the result length is 1
+    zlayer.set_weights(zlayer_weights)
 
 def predict(config):
     ######## Read input config ########
@@ -244,17 +396,22 @@ def predict(config):
     global_conf = config["global"]
     weights_file = str(global_conf['weights_file']) + '.' + str(global_conf['test_weights_iters'])
 
-    model = load_model(config)
-    model.load_weights(weights_file)
+    zmodel = load_zoo_model(config)
+    # model.load_weights(weights_file)
+    kmodel = load_keras2_model(config)
+
+    ######## Get and Set Weights ########
+    set_weights_per_layer(kmodel, zmodel, "embedding")
+    set_weights_per_layer(kmodel, zmodel, "dense")
 
     eval_metrics = OrderedDict()
     for mobj in config['metrics']:
         mobj = mobj.lower()
         if '@' in mobj:
             mt_key, mt_val = mobj.split('@', 1)
-            eval_metrics[mobj] = metric.get(mt_key)(int(mt_val))
+            eval_metrics[mobj] = metrics.get(mt_key)(int(mt_val))
         else:
-            eval_metrics[mobj] = metric.get(mobj)
+            eval_metrics[mobj] = metrics.get(mobj)
     res = dict([[k,0.] for k in eval_metrics.keys()])
 
     for tag, generator in predict_gen.items():
@@ -263,7 +420,15 @@ def predict(config):
         num_valid = 0
         res_scores = {}
         for input_data, y_true in genfun:
-            y_pred = model.predict(input_data, batch_size=len(y_true) )
+            ky_pred = kmodel.predict(input_data, batch_size=len(y_true))
+            names = ['query', 'doc']
+            shapes = [(None, 10), (None, 40)]
+            list_input_data = standardize_input_data(input_data, names, shapes, check_batch_axis=False)
+           # list_input_data = [data[0:2, :] for data in list_input_data]
+            # y_pred = zmodel.predict(list_input_data, distributed=False)
+            y_pred = zmodel.forward(list_input_data)
+            equal = np.allclose(y_pred, ky_pred, rtol=1e-5, atol=1e-5)
+            print(equal)
 
             if issubclass(type(generator), inputs.list_generator.ListBasicGenerator):
                 list_counts = input_data['list_counts']
@@ -313,7 +478,7 @@ def predict(config):
 def main(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument('--phase', default='train', help='Phase: Can be train or predict, the default value is train.')
-    parser.add_argument('--model_file', default='./models/arci.config', help='Model_file: MatchZoo model file for the chosen model.')
+    parser.add_argument('--model_file', default='./models/knrm_wikiqa.config', help='Model_file: MatchZoo model file for the chosen model.')
     args = parser.parse_args()
     model_file =  args.model_file
     with open(model_file, 'r') as f:
