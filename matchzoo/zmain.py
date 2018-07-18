@@ -24,7 +24,6 @@ import keras.backend as KK
 import keras.layers as klayers
 
 from utils import *
-from losses import zrank_losses
 import inputs
 import metrics
 
@@ -84,6 +83,24 @@ def kloss(y_true, y_pred):
     y_neg = klayers.Lambda(lambda a: a[1::2, :], output_shape=(1,))(y_pred)
     loss = KK.maximum(0., margin + y_neg - y_pos)
     return KK.mean(loss)
+
+def gen_zinput(zoo_input_data, zoo_label):
+    zinput1 = []
+    for x in zoo_input_data:
+        zinput1.append(x[0])
+    zinput1 = np.concatenate(zinput1)
+    zinput2 = []
+    for x in zoo_input_data:
+        zinput2.append(x[1])
+    zinput2 = np.concatenate(zinput2)
+
+    zinput = []
+    zinput.append(zinput1)
+    zinput.append(zinput2)
+
+    zlabel = np.concatenate(zoo_label)
+
+    return zinput, zlabel
 
 def train(config):
 
@@ -166,11 +183,6 @@ def train(config):
 
     loss = []
 
-    for lobj in config['losses']:
-        if lobj['object_name'] in zrank_losses.mz_specialized_losses:
-            loss.append(zrank_losses.get(lobj['object_name'])(lobj['object_params']))
-        else:
-            loss.append(zrank_losses.get(lobj['object_name']))
     eval_metrics = OrderedDict()
     for mobj in config['metrics']:
         mobj = mobj.lower()
@@ -200,21 +212,8 @@ def train(config):
                 y_true_value = np.expand_dims(y_true_value, 1)
                 zoo_label.append(y_true_value)
 
-    #stack input data and label
-    zinput1 = []
-    for x in zoo_input_data:
-        zinput1.append(x[0])
-    zinput1 = np.concatenate(zinput1)
-    zinput2 = []
-    for x in zoo_input_data:
-        zinput2.append(x[1])
-    zinput2 = np.concatenate(zinput2)
+    zinput, zlabel = gen_zinput(zoo_input_data, zoo_label)
 
-    zinput = []
-    zinput.append(zinput1)
-    zinput.append(zinput2)
-
-    zlabel = np.concatenate(zoo_label)
     zmodel.fit(zinput, zlabel, batch_size=280, nb_epoch=1, distributed=False)
 
     for i_e in range(num_iters):
@@ -404,6 +403,13 @@ def predict(config):
     set_weights_per_layer(kmodel, zmodel, "embedding")
     set_weights_per_layer(kmodel, zmodel, "dense")
 
+    # keras2_y_pred = kmodel.predict(input_data, batch_size=batch_size)
+    # y_pred = model.forward(input_data)
+    # # y_pred = model.predict(input_data, distributed=False)
+    # equal = np.allclose(y_pred, keras2_y_pred, rtol=1e-5, atol=1e-5)
+    # print(equal)
+    # return y_pred
+
     eval_metrics = OrderedDict()
     for mobj in config['metrics']:
         mobj = mobj.lower()
@@ -414,6 +420,14 @@ def predict(config):
             eval_metrics[mobj] = metrics.get(mobj)
     res = dict([[k,0.] for k in eval_metrics.keys()])
 
+    # batch_size = 20
+    # query_data = np.random.randint(0, 10000, [batch_size, 10])
+    # doc_data = np.random.randint(0, 10000, [batch_size, 40])
+    # input_data = [query_data, doc_data]
+    # keras2_y_pred = keras2_model.predict(input_data, batch_size=batch_size)
+    # y_pred = model.predict(input_data, distributed=False)
+    # equal = np.allclose(y_pred, keras2_y_pred, rtol=1e-5, atol=1e-5)
+    # 16
     for tag, generator in predict_gen.items():
         genfun = generator.get_batch_generator()
         print('[%s]\t[Predict] @ %s ' % (time.strftime('%m-%d-%Y %H:%M:%S', time.localtime(time.time())), tag), end='')
