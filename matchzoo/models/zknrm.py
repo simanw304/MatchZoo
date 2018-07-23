@@ -42,9 +42,10 @@ class ZKNRM(BasicModel):
                 return A.exp(-0.5 * (x - mu) * (x - mu) / sigma / sigma)
             return A.Lambda(lambda x: kernel(x)) #Activation(kernel)
 
-        query = klayers1.Input(name='query', shape=(self.config['text1_maxlen'],))
+        input = klayers1.Input(name='input', shape=(50,))
+        query = input.slice(1, 0, 10) #klayers1.Input(name='query', shape=(self.config['text1_maxlen'],))
         #show_layer_info('Input', query)
-        doc = klayers1.Input(name='doc', shape=(self.config['text2_maxlen'],))
+        doc = input.slice(1, 10, 40) #klayers1.Input(name='doc', shape=(self.config['text2_maxlen'],))
         #show_layer_info('Input', doc)
         embedding = klayers1.Embedding(self.config['vocab_size'], self.config['embed_size'],
                               name="embedding") # weights=[self.config['embed']], trainable=self.config['train_embed'],
@@ -80,6 +81,7 @@ class ZKNRM(BasicModel):
             out_ = Dense(1, bias_initializer='zero', name="dense")(Phi)
         #show_layer_info('Dense', out_)
 
-        model = Model(input=[query, doc], output=[out_])
+        #timedistributed = layer1.TimeDistributed(out_, input_shape=(10, 12))
+        model = Model(input=input, output=[out_])
         return model
 
