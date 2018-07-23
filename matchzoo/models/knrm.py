@@ -7,8 +7,8 @@ from keras.models import Sequential, Model
 from keras.layers import *
 from keras.initializers import Constant, RandomNormal, RandomUniform
 from keras.activations import softmax
-from model import BasicModel
-from utils.utility import *
+from matchzoo.models.model import BasicModel
+from matchzoo.utils.utility import *
 
 class KNRM(BasicModel):
     def __init__(self, config):
@@ -39,7 +39,9 @@ class KNRM(BasicModel):
         show_layer_info('Input', query)
         doc = Input(name='doc', shape=(self.config['text2_maxlen'],))
         show_layer_info('Input', doc)
-        embedding = Embedding(self.config['vocab_size'], self.config['embed_size'], weights=[self.config['embed']], trainable=self.config['train_embed'])
+        embedding = Embedding(self.config['vocab_size'], self.config['embed_size'],
+                              weights=[self.config['embed']], trainable=self.config['train_embed'],
+                              name="embedding")
         q_embed = embedding(query)
         show_layer_info('Embedding', q_embed)
         d_embed = embedding(doc)
@@ -67,9 +69,9 @@ class KNRM(BasicModel):
         Phi = Lambda(lambda x: K.tf.stack(x, 1))(KM)
         show_layer_info('Stack', Phi)
         if self.config['target_mode'] == 'classification':
-            out_ = Dense(2, activation='softmax', kernel_initializer=RandomUniform(minval=-0.014, maxval=0.014), bias_initializer='zeros')(Phi)
+            out_ = Dense(2, activation='softmax', kernel_initializer=RandomUniform(minval=-0.014, maxval=0.014), bias_initializer='zeros', name="dense")(Phi)
         elif self.config['target_mode'] in ['regression', 'ranking']:
-            out_ = Dense(1, kernel_initializer=RandomUniform(minval=-0.014, maxval=0.014), bias_initializer='zeros')(Phi)
+            out_ = Dense(1, kernel_initializer=RandomUniform(minval=-0.014, maxval=0.014), bias_initializer='zeros', name="dense")(Phi)
         show_layer_info('Dense', out_)
 
         model = Model(inputs=[query, doc], outputs=[out_])
