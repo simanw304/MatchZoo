@@ -18,6 +18,7 @@ from zoo.pipeline.api.keras.layers import *
 from zoo.pipeline.api.keras.models import *
 from bigdl.keras.converter import WeightsConverter
 from bigdl.optim.optimizer import Adam
+from zoo.common.nncontext import *
 from zoo.pipeline.api.keras.engine.topology import *
 import numpy as np
 import keras.backend as KK
@@ -251,9 +252,9 @@ def train(config):
     batch_num_per_epoch = 10
     #train_as_whole(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics)
     z_knrm_model.set_tensorboard("/tmp/matchzoo", "knrm-sgd-1e4")
-    train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod=SGD(1e-4))
+    # train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod=SGD(1e-4))
 
-    # train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod=SGD(1e-4, leaningrate_schedule=Poly(0.5, 50 * 400)))
+    train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod=SGD(1e-4, leaningrate_schedule=Poly(0.5, 50 * 400)))
     #train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod="adam")
 
 
@@ -463,6 +464,7 @@ def predict(config):
         sys.stdout.flush()
 
 def main(argv):
+    init_nncontext()
     parser = argparse.ArgumentParser()
     parser.add_argument('--phase', default='train', help='Phase: Can be train or predict, the default value is train.')
     parser.add_argument('--model_file', default='./models/knrm_wikiqa.config', help='Model_file: MatchZoo model file for the chosen model.')
