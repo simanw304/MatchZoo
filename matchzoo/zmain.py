@@ -99,6 +99,61 @@ def preprocess(input_data):
     return result
 
 
+def eval(eval_gen, eval_metrics, zmodel):
+    for tag, generator in eval_gen.items():
+
+        genfun = generator.get_batch_generator()
+
+        print('[%s]\t[Eval:%s] ' % (time.strftime('%m-%d-%Y %H:%M:%S', time.localtime(time.time())), tag), end='')
+        res = dict([[k,0.] for k in eval_metrics.keys()])
+        num_valid = 0
+        for input_data, y_true in genfun:
+            names = ['query', 'doc']
+            shapes = [(None, 10), (None, 40)]
+            list_input_data = _standardize_input_data(input_data, names, shapes, check_batch_axis=False)
+
+            preprocessed_input_data = np.concatenate((list_input_data[0], list_input_data[1]), axis=1)
+
+            y_pred = zmodel.forward(preprocessed_input_data)
+            if issubclass(type(generator), inputs.list_generator.ListBasicGenerator):
+                list_counts = input_data['list_counts']
+                for k, eval_func in eval_metrics.items():
+                    for lc_idx in range(len(list_counts)-1):
+                        pre = list_counts[lc_idx]
+                        suf = list_counts[lc_idx+1]
+                        res[k] += eval_func(y_true = y_true[pre:suf], y_pred = y_pred[pre:suf])
+                num_valid += len(list_counts) - 1
+            else:
+                for k, eval_func in eval_metrics.items():
+                    res[k] += eval_func(y_true = y_true, y_pred = y_pred)
+                num_valid += 1
+        generator.reset()
+        i_e = 0
+        print('Iter:%d\t%s' % (i_e, '\t'.join(['%s=%f'%(k,v/num_valid) for k, v in res.items()])), end='\n')
+        sys.stdout.flush()
+
+# Return  List(batch_input, batch_input, .....)
+# there are totally 8995 pair in the dataset, and each time we would take a batch(100) samples
+# roughly, set batch_num=100 would take the entire pairs.
+def generate_training_data(train_gen, batch_num):
+    zoo_input_data = []
+    zoo_label = []
+    count = 0
+    while True:
+        for tag, generator in train_gen.items():
+            genfun = generator.get_batch_generator()
+            for input_data, y_true_value in genfun:
+                count += 1
+                if count > batch_num:
+                    return (zoo_input_data, zoo_label)
+                names = ['query', 'doc']
+                shapes = [(None, 10), (None, 40)]
+                list_input_data = _standardize_input_data(input_data, names, shapes,
+                                                          check_batch_axis=False)
+                zoo_input_data.append(list_input_data)
+                y_true_value = np.expand_dims(y_true_value, 1)
+                zoo_label.append(y_true_value)
+
 def train(config):
 
     print(json.dumps(config, indent=2), end='\n')
@@ -180,9 +235,7 @@ def train(config):
 
     input = Input(name='input', shape=(2, 50))
     timeDistributed = TimeDistributed(layer = zmodel, input_shape=(2, 50))(input)
-    new_model = Model(input=input, output=timeDistributed)
-
-    loss = []
+    z_knrm_model = Model(input=input, output=timeDistributed)
 
     eval_metrics = OrderedDict()
     for mobj in config['metrics']:
@@ -193,62 +246,49 @@ def train(config):
         else:
             eval_metrics[mobj] = metrics.get(mobj)
 
-    new_model.compile(optimizer='adam', loss=zloss(batch=10))
+    epoch_num = 400
+    batch_size = 200  # take a look at the config
+    batch_num_per_epoch = 10
+    #train_as_whole(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics)
+    z_knrm_model.set_tensorboard("/tmp/matchzoo", "knrm-sgd-1e4")
+    train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod=SGD(1e-4))
+
+    # train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod=SGD(1e-4, leaningrate_schedule=Poly(0.5, 50 * 400)))
+    #train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, optimMethod="adam")
+
+
+def train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, epoch_num=400, batch_size=200, optimMethod=SGD(1e-4)):
+    z_knrm_model.compile(optimizer=optimMethod, loss=zloss(batch=10))
     print('[Model] Model Compile Done.', end='\n')
-    zoo_input_data = []
-    zoo_label = []
-    count = 0
-
-    for i_e in range(num_iters):
-        for tag, generator in train_gen.items():
-            genfun = generator.get_batch_generator()
-            for input_data, y_true_value in genfun:
-                count += 1
-                if count > 4000:
-                    break
-                names = ['query', 'doc']
-                shapes = [(None, 10), (None, 40)]
-                list_input_data = _standardize_input_data(input_data, names, shapes, check_batch_axis=False)
-                zoo_input_data.append(list_input_data)
-                y_true_value = np.expand_dims(y_true_value, 1)
-                zoo_label.append(y_true_value)
-
-    # preprocess input data
+    total_batches = 100
+    total_samples = total_batches * batch_size
+    # take 100 batch, each batch has 100 samples.
+    # and each time the training process take 200 samples to assemble a batch for training
+    # so there are 50 iteration for each epoch.
+    (zoo_input_data, zoo_label) = generate_training_data(train_gen, batch_num=total_batches)
     new_zinput = preprocess(zoo_input_data)
+    zoo_label = np.ones([int(total_samples/2), 2, 1])
+    for i in range(0, epoch_num):
+        z_knrm_model.fit(new_zinput, zoo_label, batch_size=200, nb_epoch=1, distributed=False)
+        # z_knrm_model.saveModel('new_model_Adam.model', over_write=True)
+        # zmodel.saveModel('zmodel.model', over_write=True)
+        eval(eval_gen, eval_metrics, zmodel)
 
-    new_model.fit(new_zinput, np.ones([400000, 2, 1]), batch_size=200, nb_epoch=1, distributed=False)
-    new_model.saveModel('/home/matchzoo/new_model_Adam.model', over_write=True)
-    zmodel.saveModel('/home/matchzoo/zmodel.model', over_write=True)
-
-    for tag, generator in eval_gen.items():
-        genfun = generator.get_batch_generator()
-        print('[%s]\t[Eval:%s] ' % (time.strftime('%m-%d-%Y %H:%M:%S', time.localtime(time.time())), tag), end='')
-        res = dict([[k,0.] for k in eval_metrics.keys()])
-        num_valid = 0
-        for input_data, y_true in genfun:
-            names = ['query', 'doc']
-            shapes = [(None, 10), (None, 40)]
-            list_input_data = _standardize_input_data(input_data, names, shapes, check_batch_axis=False)
-            preprocessed_input_data = np.concatenate((list_input_data[0], list_input_data[1]), axis=1)
-            y_pred = zmodel.forward(preprocessed_input_data)
-            if issubclass(type(generator), inputs.list_generator.ListBasicGenerator):
-                list_counts = input_data['list_counts']
-                for k, eval_func in eval_metrics.items():
-                    for lc_idx in range(len(list_counts)-1):
-                        pre = list_counts[lc_idx]
-                        suf = list_counts[lc_idx+1]
-                        res[k] += eval_func(y_true = y_true[pre:suf], y_pred = y_pred[pre:suf])
-                num_valid += len(list_counts) - 1
-            else:
-                for k, eval_func in eval_metrics.items():
-                    res[k] += eval_func(y_true = y_true, y_pred = y_pred)
-                num_valid += 1
-        generator.reset()
-        i_e = 0
-        print('Iter:%d\t%s' % (i_e, '\t'.join(['%s=%f'%(k,v/num_valid) for k, v in res.items()])), end='\n')
-        sys.stdout.flush()
-        # if (i_e+1) % save_weights_iters == 0:
-        #     zmodel.save_weights(weights_file % (i_e+1))
+def train_as_whole(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics):
+    z_knrm_model.compile(optimizer='adam', loss=zloss(batch=10))
+    print('[Model] Model Compile Done.', end='\n')
+    epoch_num = 400
+    batch_num_per_epoch = 10
+    batch_size = 200 # take a look at the config
+    total_batches = epoch_num * batch_num_per_epoch
+    total_samples = total_batches * batch_size
+    (zoo_input_data, zoo_label) = generate_training_data(train_gen, batch_num=total_batches)
+    new_zinput = preprocess(zoo_input_data)
+    zoo_label = np.ones([int(total_samples/2), 2, 1])
+    z_knrm_model.fit(new_zinput, zoo_label, batch_size=200, nb_epoch=1, distributed=False)
+    z_knrm_model.saveModel('new_model_Adam.model', over_write=True)
+    zmodel.saveModel('zmodel.model', over_write=True)
+    eval(eval_gen, eval_metrics, zmodel)
 
 
 def set_weights_per_layer(kmodel, zmodel, layer_name):
