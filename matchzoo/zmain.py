@@ -262,8 +262,9 @@ def train_per_epoch(z_knrm_model, zmodel, train_gen, eval_gen, eval_metrics, epo
     print('[Model] Model Compile Done.', end='\n')
     total_batches = 100
     total_samples = total_batches * batch_size
-    # take 100 batch, each batch has 100 samples.
-    # and each time the training process take 200 samples to assemble a batch for training
+    # The generating logic would try to take 100 batch from gen and each batch has 100 samples.
+    # 100 batch is enough, as there are only around 10000 pairs in the dataset.
+    # Each time the training process take 200 samples to assemble a batch for training,
     # so there are 50 iteration for each epoch.
     (zoo_input_data, zoo_label) = generate_training_data(train_gen, batch_num=total_batches)
     new_zinput = preprocess(zoo_input_data)
